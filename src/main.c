@@ -13,6 +13,8 @@ typedef struct {
     SDL_GPUDevice *gpu;
     SDL_GPUBuffer *vertex_buffer;
     SDL_GPUGraphicsPipeline *pipeline;
+    SDL_GPUTexture *texture;
+    SDL_GPUSampler *sampler;
     SDL_AppResult quit;
     uint64_t ticks_freq;
     uint64_t last_frame_ticks;
@@ -22,51 +24,71 @@ AppState g_app = { .quit = SDL_APP_CONTINUE };
 
 typedef struct {
     float pos[2];
-    float color[3];
+    float tex[2];
+    float color[4];
 } Vertex;
-
-const SDL_GPUVertexBufferDescription vertex_descs[] = {
-    {.slot = 0, .pitch = sizeof(Vertex), .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX},
-    {.slot = 1, .pitch = sizeof(Vertex), .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX},
-};
 
 const SDL_GPUVertexAttribute vertex_attrs[] = {
     {.location = 0, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = offsetof(Vertex, pos)},
-    {.location = 1, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = offsetof(Vertex, color)},
-};
-
-const SDL_GPUVertexInputState vertex_input_state = {
-    .vertex_buffer_descriptions = vertex_descs, .num_vertex_buffers = ARRAY_LENGTH(vertex_descs),
-    .vertex_attributes = vertex_attrs, .num_vertex_attributes = ARRAY_LENGTH(vertex_attrs),
+    {.location = 1, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = offsetof(Vertex, tex)},
+    {.location = 2, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, .offset = offsetof(Vertex, color)},
 };
 
 #define V_DIM 0.5
 const Vertex vertices[] = {
-    {{-V_DIM, -V_DIM}, {1, 0, 0}},
-    {{+V_DIM, -V_DIM}, {0, 0, 1}},
-    {{-V_DIM, +V_DIM}, {0, 1, 0}},
-    {{+V_DIM, -V_DIM}, {0, 0, 1}},
-    {{+V_DIM, +V_DIM}, {1, 0, 1}},
-    {{-V_DIM, +V_DIM}, {0, 1, 0}},
+    {.pos = {-V_DIM, -V_DIM}, .tex = {0, 1}, .color = {1, 0, 0, 1}},
+    {.pos = {+V_DIM, -V_DIM}, .tex = {1, 1}, .color = {0, 0, 1, 1}},
+    {.pos = {-V_DIM, +V_DIM}, .tex = {0, 0}, .color = {0, 1, 0, 1}},
+    {.pos = {+V_DIM, -V_DIM}, .tex = {1, 1}, .color = {0, 0, 1, 1}},
+    {.pos = {+V_DIM, +V_DIM}, .tex = {1, 0}, .color = {1, 0, 1, 1}},
+    {.pos = {-V_DIM, +V_DIM}, .tex = {0, 0}, .color = {0, 1, 0, 1}},
 };
 
 const uint8_t icon_data[] = {
     #embed "icon.png"
 };
 
-static bool set_icon(SDL_Window *window) {
+typedef struct {
+    uint8_t *data;
+    int w, h, channels;
+} ImageData;
+
+static size_t image_size(ImageData id) { return id.w * id.h * id.channels; }
+
+const SDL_PixelFormat CHANNELS_TO_SDL_PIXELFORMAT[] = {
+    0, 0, 0, SDL_PIXELFORMAT_RGB24, SDL_PIXELFORMAT_RGBA32,
+};
+
+const SDL_GPUTextureFormat CHANNELS_TO_SDL_GPU_TEXTURE_FORMAT[] = {
+    SDL_GPU_TEXTUREFORMAT_INVALID,
+    SDL_GPU_TEXTUREFORMAT_R8_UNORM,
+    SDL_GPU_TEXTUREFORMAT_R8G8_UNORM,
+    SDL_GPU_TEXTUREFORMAT_INVALID, // SDL_GPU_TEXTUREFORMAT_R8G8B8_UNORM,
+    SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+};
+
+// set desired_channels to 0 to use the channels in the file
+static ImageData load_image(const uint8_t *buf, int len, int desired_channels) {
+    ImageData result = {};
+    int channels_in_file;
+    result.data = stbi_load_from_memory(buf, len, &result.w, &result.h, &channels_in_file, desired_channels);
+    if (!result.data) {
+        SDL_Log("ERROR: stbi_load_from_memory");
+    } else {
+        result.channels = desired_channels ? desired_channels : channels_in_file;
+    }
+    return result;
+}
+
+static void free_image(ImageData id) {
+    stbi_image_free(id.data);
+}
+
+static bool set_icon(SDL_Window *window, ImageData img) {
     SDL_Surface *sfc = nullptr;
-    uint8_t *data = nullptr;
     bool result = false;
 
-    int w, h;
-    data = stbi_load_from_memory(icon_data, sizeof(icon_data), &w, &h, nullptr, 4);
-    if (!data) {
-        SDL_Log("ERROR: stbi_load_from_memory");
-        goto exit;
-    }
-
-    sfc = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_RGBA8888, data, w * 4);
+    sfc = SDL_CreateSurfaceFrom(img.w, img.h, CHANNELS_TO_SDL_PIXELFORMAT[img.channels], img.data, img.w * img.channels);
     if (!sfc) {
         SDL_Log("ERROR: SDL_CreateSurfaceFrom: %s", SDL_GetError());
         goto exit;
@@ -81,8 +103,6 @@ static bool set_icon(SDL_Window *window) {
 exit:
     if (sfc)
         SDL_DestroySurface(sfc);
-    if (data)
-        stbi_image_free(data);
     return result;
 }
 
@@ -103,10 +123,14 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return sdl_fail("SDL_CreateGPUDevice");
     SDL_Log("SDL GPU driver: %s", SDL_GetGPUDeviceDriver(g_app.gpu));
 
+    ImageData icon_img = load_image(icon_data, sizeof(icon_data), 4);
+    if (!icon_img.data)
+        return SDL_APP_FAILURE;
+
     g_app.window = SDL_CreateWindow("App", 1024, 1024, SDL_WINDOW_RESIZABLE|SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_app.window)
         return sdl_fail("SDL_CreateWindow");
-    if (!set_icon(g_app.window))
+    if (!set_icon(g_app.window, icon_img))
         return SDL_APP_FAILURE;
 
     if (!SDL_ClaimWindowForGPUDevice(g_app.gpu, g_app.window))
@@ -117,15 +141,42 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (!g_app.vertex_buffer)
         return sdl_fail("SDL_CreateGPUBuffer vertex_buffer");
 
+    // Create texture
+    g_app.texture = SDL_CreateGPUTexture(g_app.gpu, &(SDL_GPUTextureCreateInfo){
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        // .format = CHANNELS_TO_SDL_GPU_TEXTURE_FORMAT[icon_img.channels],
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = icon_img.w,
+        .height = icon_img.h,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    });
 
-    // Upload vertex data
+    g_app.sampler = SDL_CreateGPUSampler(g_app.gpu, &(SDL_GPUSamplerCreateInfo){
+        .min_filter = SDL_GPU_FILTER_LINEAR,
+        .mag_filter = SDL_GPU_FILTER_LINEAR,
+        .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
+        .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+    });
+
+    // Upload vertex data and texture
+    size_t transfer_size = sizeof(vertices) + image_size(icon_img);
+    size_t vertices_offset, texture_offset;
     SDL_GPUTransferBuffer *transfer_buffer = SDL_CreateGPUTransferBuffer(g_app.gpu,
-        &(SDL_GPUTransferBufferCreateInfo){.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = sizeof(vertices)});
+        &(SDL_GPUTransferBufferCreateInfo){.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = transfer_size});
     if (!transfer_buffer)
         return sdl_fail("SDL_CreateGPUTransferBuffer");
     {
         uint8_t *map = SDL_MapGPUTransferBuffer(g_app.gpu, transfer_buffer, false);
-        SDL_memcpy(map, vertices, sizeof(vertices));
+
+        vertices_offset = 0;
+        SDL_memcpy(map + vertices_offset, vertices, sizeof(vertices));
+
+        texture_offset = sizeof(vertices);
+        SDL_memcpy(map + texture_offset, icon_img.data, image_size(icon_img));
+
         SDL_UnmapGPUTransferBuffer(g_app.gpu, transfer_buffer);
     }
     {
@@ -135,14 +186,23 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmdbuf);
         SDL_UploadToGPUBuffer(
             cp,
-            &(SDL_GPUTransferBufferLocation){.transfer_buffer = transfer_buffer, .offset = 0},
+            &(SDL_GPUTransferBufferLocation){.transfer_buffer = transfer_buffer, .offset = vertices_offset},
             &(SDL_GPUBufferRegion){g_app.vertex_buffer, 0, sizeof(vertices)},
+            false);
+        SDL_UploadToGPUTexture(cp,
+            &(SDL_GPUTextureTransferInfo){.transfer_buffer = transfer_buffer, .offset = texture_offset, .pixels_per_row = icon_img.w},
+            &(SDL_GPUTextureRegion){
+                .texture = g_app.texture, .mip_level = 0, .layer  = 0,
+                .x = 0, .y = 0, .w = icon_img.w, .h = icon_img.h, .d = 1,
+            },
             false);
         SDL_EndGPUCopyPass(cp);
         if (!SDL_SubmitGPUCommandBuffer(cmdbuf))
             return sdl_fail("SDL_SubmitGPUCommandBuffer");
     }
     SDL_ReleaseGPUTransferBuffer(g_app.gpu, transfer_buffer);
+
+    free_image(icon_img);
 
     // Create pipeline
     SDL_GPUShader *vs = SDL_CreateGPUShader(g_app.gpu, &(SDL_GPUShaderCreateInfo){
@@ -161,21 +221,36 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         .entrypoint = "main",
         .format = SDL_GPU_SHADERFORMAT_SPIRV,
         .stage = SDL_GPU_SHADERSTAGE_FRAGMENT,
+        .num_samplers = 1,
     });
     if (!fs)
         return sdl_fail("SDL_CreateGPUShader shader_code_quad_frag");
 
-    auto color_target_desc = (SDL_GPUColorTargetDescription){.format = SDL_GetGPUSwapchainTextureFormat(g_app.gpu, g_app.window)};
+    auto color_target_desc = (SDL_GPUColorTargetDescription){
+        .format = SDL_GetGPUSwapchainTextureFormat(g_app.gpu, g_app.window),
+        .blend_state = (SDL_GPUColorTargetBlendState){
+            .enable_blend = true,
+            .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+            .dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .color_blend_op = SDL_GPU_BLENDOP_ADD,
+            .src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE,
+            .dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO,
+            .alpha_blend_op = SDL_GPU_BLENDOP_ADD,
+        },
+    };
+    auto vertex_input_state = (SDL_GPUVertexInputState){
+        .vertex_buffer_descriptions = &(SDL_GPUVertexBufferDescription){.slot = 0, .pitch = sizeof(Vertex), .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX},
+        .num_vertex_buffers = 1,
+        .vertex_attributes = vertex_attrs,
+        .num_vertex_attributes = ARRAY_LENGTH(vertex_attrs),
+    };
+
     g_app.pipeline = SDL_CreateGPUGraphicsPipeline(g_app.gpu, &(SDL_GPUGraphicsPipelineCreateInfo){
         .vertex_shader = vs,
         .fragment_shader = fs,
         .vertex_input_state = vertex_input_state,
         .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
-        .rasterizer_state = (SDL_GPURasterizerState){
-            .fill_mode = SDL_GPU_FILLMODE_FILL,
-            .cull_mode = SDL_GPU_CULLMODE_BACK,
-            .front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE
-        },
+        .rasterizer_state = (SDL_GPURasterizerState){.fill_mode = SDL_GPU_FILLMODE_FILL, .cull_mode = SDL_GPU_CULLMODE_BACK, .front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE},
         .multisample_state = (SDL_GPUMultisampleState){.sample_count = SDL_GPU_SAMPLECOUNT_1},
         .target_info = (SDL_GPUGraphicsPipelineTargetInfo){.color_target_descriptions = &color_target_desc, .num_color_targets = 1},
     });
@@ -225,6 +300,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
         SDL_BindGPUGraphicsPipeline(pass, g_app.pipeline);
         SDL_BindGPUVertexBuffers(pass, 0, &(SDL_GPUBufferBinding){.buffer = g_app.vertex_buffer, .offset = 0}, 1);
+        SDL_BindGPUFragmentSamplers(pass, 0, &(SDL_GPUTextureSamplerBinding){g_app.texture, g_app.sampler}, 1);
         SDL_DrawGPUPrimitives(pass, ARRAY_LENGTH(vertices), 1, 0, 0);
 
         SDL_EndGPURenderPass(pass);
@@ -247,6 +323,10 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
 void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     (void)appstate;
     SDL_Log("SDL_AppQuit %d", result);
+    if (g_app.vertex_buffer)
+        SDL_ReleaseGPUBuffer(g_app.gpu, g_app.vertex_buffer);
+    if (g_app.pipeline)
+        SDL_ReleaseGPUGraphicsPipeline(g_app.gpu, g_app.pipeline);
     if (g_app.gpu && g_app.window)
         SDL_ReleaseWindowFromGPUDevice(g_app.gpu, g_app.window);
     if (g_app.window)
