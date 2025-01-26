@@ -3,3 +3,9 @@
 **build source:** `./build.sh`
 
 **run:** `build/pf2`
+
+**build dependencies:**
+
+```
+dnf install clang glslc xxd
+```

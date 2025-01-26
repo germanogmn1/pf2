@@ -1,23 +1,22 @@
-#include <stdint.h>
 #define SDL_MAIN_USE_CALLBACKS
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL.h>
-#define STB_IMAGE_IMPLEMENTATION
-#include <stb_image.h>
+#include "defs.h"
+#include "image.h"
+#include "gpu.h"
 #include "shaders/shaders_gen.h"
-
-#define ARRAY_LENGTH(a) (sizeof(a) / sizeof((a)[0]))
 
 typedef struct {
     SDL_Window *window;
     SDL_GPUDevice *gpu;
     SDL_GPUBuffer *vertex_buffer;
     SDL_GPUGraphicsPipeline *pipeline;
-    SDL_GPUTexture *texture;
     SDL_GPUSampler *sampler;
+    SDL_GPUTexture *texture, *alien_tex;
     SDL_AppResult quit;
     uint64_t ticks_freq;
     uint64_t last_frame_ticks;
+    const char *base_path;
 } AppState;
 
 AppState g_app = { .quit = SDL_APP_CONTINUE };
@@ -34,7 +33,7 @@ const SDL_GPUVertexAttribute vertex_attrs[] = {
     {.location = 2, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, .offset = offsetof(Vertex, color)},
 };
 
-#define V_DIM 0.5
+#define V_DIM 1
 const Vertex vertices[] = {
     {.pos = {-V_DIM, -V_DIM}, .tex = {0, 1}, .color = {1, 0, 0, 1}},
     {.pos = {+V_DIM, -V_DIM}, .tex = {1, 1}, .color = {0, 0, 1, 1}},
@@ -48,47 +47,11 @@ const uint8_t icon_data[] = {
     #embed "icon.png"
 };
 
-typedef struct {
-    uint8_t *data;
-    int w, h, channels;
-} ImageData;
-
-static size_t image_size(ImageData id) { return id.w * id.h * id.channels; }
-
-const SDL_PixelFormat CHANNELS_TO_SDL_PIXELFORMAT[] = {
-    0, 0, 0, SDL_PIXELFORMAT_RGB24, SDL_PIXELFORMAT_RGBA32,
-};
-
-const SDL_GPUTextureFormat CHANNELS_TO_SDL_GPU_TEXTURE_FORMAT[] = {
-    SDL_GPU_TEXTUREFORMAT_INVALID,
-    SDL_GPU_TEXTUREFORMAT_R8_UNORM,
-    SDL_GPU_TEXTUREFORMAT_R8G8_UNORM,
-    SDL_GPU_TEXTUREFORMAT_INVALID, // SDL_GPU_TEXTUREFORMAT_R8G8B8_UNORM,
-    SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-};
-
-// set desired_channels to 0 to use the channels in the file
-static ImageData load_image(const uint8_t *buf, int len, int desired_channels) {
-    ImageData result = {};
-    int channels_in_file;
-    result.data = stbi_load_from_memory(buf, len, &result.w, &result.h, &channels_in_file, desired_channels);
-    if (!result.data) {
-        SDL_Log("ERROR: stbi_load_from_memory");
-    } else {
-        result.channels = desired_channels ? desired_channels : channels_in_file;
-    }
-    return result;
-}
-
-static void free_image(ImageData id) {
-    stbi_image_free(id.data);
-}
-
 static bool set_icon(SDL_Window *window, ImageData img) {
     SDL_Surface *sfc = nullptr;
     bool result = false;
 
-    sfc = SDL_CreateSurfaceFrom(img.w, img.h, CHANNELS_TO_SDL_PIXELFORMAT[img.channels], img.data, img.w * img.channels);
+    sfc = SDL_CreateSurfaceFrom(img.w, img.h, SDL_PIXELFORMAT_RGBA32, img.data, img.w * img.channels);
     if (!sfc) {
         SDL_Log("ERROR: SDL_CreateSurfaceFrom: %s", SDL_GetError());
         goto exit;
@@ -106,6 +69,52 @@ exit:
     return result;
 }
 
+static uint8_t *read_asset(const char *filename, size_t *out_size) {
+    char path[512];
+    SDL_snprintf(path, sizeof(path), "%s/assets/%s", g_app.base_path, filename);
+    SDL_IOStream *io = SDL_IOFromFile(path, "rb");
+    if (!io) {
+        SDL_Log("ERROR: Failed to open file '%s': %s", path, SDL_GetError());
+        return nullptr;
+    }
+
+    uint8_t *data = nullptr;
+    int64_t ssize = SDL_GetIOSize(io);
+    if (ssize < 0) {
+        SDL_Log("ERROR: SDL_GetIOSize '%s': %s", path, SDL_GetError());
+        goto close;
+    }
+    size_t size = (size_t)ssize;
+    data = SDL_malloc(size);
+    if (!SDL_ReadIO(io, data, size)) {
+        SDL_Log("ERROR: SDL_ReadIO '%s': %s", path, SDL_GetError());
+        SDL_free(data);
+        data = nullptr;
+        goto close;
+    }
+    if (out_size)
+        *out_size = size;
+close:
+    if (!SDL_CloseIO(io))
+        SDL_Log("WARNING: SDL_CloseIO '%s': %s", path, SDL_GetError());
+    return data;
+}
+
+static void free_asset(uint8_t *data) {
+    if (data)
+        SDL_free(data);
+}
+
+static ImageData load_asset_image(const char *filename, int channels) {
+    size_t size;
+    uint8_t *data = read_asset(filename, &size);
+    if (!data)
+        return (ImageData){};
+    auto result = load_image(data, size, channels);
+    free_asset(data);
+    return result;
+}
+
 static SDL_AppResult sdl_fail(const char *message) {
     SDL_Log("ERROR: %s: %s", message, SDL_GetError());
     return SDL_APP_FAILURE;
@@ -118,6 +127,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (!SDL_Init(SDL_INIT_VIDEO))
         return sdl_fail("SDL_Init");
 
+    g_app.base_path = SDL_GetBasePath();
     g_app.gpu = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, true, nullptr);
     if (!g_app.gpu)
         return sdl_fail("SDL_CreateGPUDevice");
@@ -136,73 +146,53 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (!SDL_ClaimWindowForGPUDevice(g_app.gpu, g_app.window))
         return sdl_fail("SDL_ClaimWindowForGPUDevice");
 
+    SDL_GPUSwapchainComposition composition = SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR;
+    if (!SDL_WindowSupportsGPUSwapchainComposition(g_app.gpu, g_app.window, composition)) {
+        SDL_Log("ERROR: SDR_LINEAR swapchain composition is not supported");
+        return SDL_APP_FAILURE;
+    }
+
+    SDL_GPUPresentMode present_mode = SDL_GPU_PRESENTMODE_VSYNC; // SDL_GPU_PRESENTMODE_MAILBOX, SDL_GPU_PRESENTMODE_IMMEDIATE
+    if (!SDL_SetGPUSwapchainParameters(g_app.gpu, g_app.window, composition, present_mode))
+        return sdl_fail("SDL_SetGPUSwapchainParameters");
+
     // Create vertex buffer
     g_app.vertex_buffer = SDL_CreateGPUBuffer(g_app.gpu, &(SDL_GPUBufferCreateInfo){SDL_GPU_BUFFERUSAGE_VERTEX, sizeof(vertices), 0});
     if (!g_app.vertex_buffer)
         return sdl_fail("SDL_CreateGPUBuffer vertex_buffer");
 
     // Create texture
-    g_app.texture = SDL_CreateGPUTexture(g_app.gpu, &(SDL_GPUTextureCreateInfo){
-        .type = SDL_GPU_TEXTURETYPE_2D,
-        // .format = CHANNELS_TO_SDL_GPU_TEXTURE_FORMAT[icon_img.channels],
-        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
-        .width = icon_img.w,
-        .height = icon_img.h,
-        .layer_count_or_depth = 1,
-        .num_levels = 1,
-    });
+    g_app.texture = create_texture_for_image(g_app.gpu, icon_img);
+    if (!g_app.texture)
+        return SDL_APP_FAILURE;
+
+    ImageData alien_img = load_asset_image("alienGreen_jump.png", 4);
+    if (!alien_img.data)
+        return SDL_APP_FAILURE;
+    g_app.alien_tex = create_texture_for_image(g_app.gpu, alien_img);
+    if (!g_app.alien_tex)
+        return SDL_APP_FAILURE;
 
     g_app.sampler = SDL_CreateGPUSampler(g_app.gpu, &(SDL_GPUSamplerCreateInfo){
-        .min_filter = SDL_GPU_FILTER_LINEAR,
-        .mag_filter = SDL_GPU_FILTER_LINEAR,
+        .min_filter = SDL_GPU_FILTER_LINEAR, .mag_filter = SDL_GPU_FILTER_LINEAR,
         .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
-        .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-        .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE, .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
     });
+    if (!g_app.sampler)
+        return sdl_fail("SDL_CreateGPUSampler");
 
     // Upload vertex data and texture
-    size_t transfer_size = sizeof(vertices) + image_size(icon_img);
-    size_t vertices_offset, texture_offset;
-    SDL_GPUTransferBuffer *transfer_buffer = SDL_CreateGPUTransferBuffer(g_app.gpu,
-        &(SDL_GPUTransferBufferCreateInfo){.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = transfer_size});
-    if (!transfer_buffer)
-        return sdl_fail("SDL_CreateGPUTransferBuffer");
-    {
-        uint8_t *map = SDL_MapGPUTransferBuffer(g_app.gpu, transfer_buffer, false);
-
-        vertices_offset = 0;
-        SDL_memcpy(map + vertices_offset, vertices, sizeof(vertices));
-
-        texture_offset = sizeof(vertices);
-        SDL_memcpy(map + texture_offset, icon_img.data, image_size(icon_img));
-
-        SDL_UnmapGPUTransferBuffer(g_app.gpu, transfer_buffer);
-    }
-    {
-        SDL_GPUCommandBuffer *cmdbuf = SDL_AcquireGPUCommandBuffer(g_app.gpu);
-        if (!cmdbuf)
-            return sdl_fail("SDL_AcquireGPUCommandBuffer");
-        SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmdbuf);
-        SDL_UploadToGPUBuffer(
-            cp,
-            &(SDL_GPUTransferBufferLocation){.transfer_buffer = transfer_buffer, .offset = vertices_offset},
-            &(SDL_GPUBufferRegion){g_app.vertex_buffer, 0, sizeof(vertices)},
-            false);
-        SDL_UploadToGPUTexture(cp,
-            &(SDL_GPUTextureTransferInfo){.transfer_buffer = transfer_buffer, .offset = texture_offset, .pixels_per_row = icon_img.w},
-            &(SDL_GPUTextureRegion){
-                .texture = g_app.texture, .mip_level = 0, .layer  = 0,
-                .x = 0, .y = 0, .w = icon_img.w, .h = icon_img.h, .d = 1,
-            },
-            false);
-        SDL_EndGPUCopyPass(cp);
-        if (!SDL_SubmitGPUCommandBuffer(cmdbuf))
-            return sdl_fail("SDL_SubmitGPUCommandBuffer");
-    }
-    SDL_ReleaseGPUTransferBuffer(g_app.gpu, transfer_buffer);
+    GPUUpload upload = begin_gpu_upload(g_app.gpu, 16 * 1024 * 1024);
+    if (!upload.size)
+        return SDL_APP_FAILURE;
+    gpu_upload_buffer(&upload, vertices, sizeof(vertices), g_app.vertex_buffer, 0);
+    gpu_upload_texture(&upload, icon_img, g_app.texture);
+    gpu_upload_texture(&upload, alien_img, g_app.alien_tex);
+    if (!end_gpu_upload(&upload))
+        return SDL_APP_FAILURE;
 
     free_image(icon_img);
+    free_image(alien_img);
 
     // Create pipeline
     SDL_GPUShader *vs = SDL_CreateGPUShader(g_app.gpu, &(SDL_GPUShaderCreateInfo){
@@ -211,6 +201,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         .entrypoint = "main",
         .format = SDL_GPU_SHADERFORMAT_SPIRV,
         .stage = SDL_GPU_SHADERSTAGE_VERTEX,
+        .num_uniform_buffers = 1,
     });
     if (!vs)
         return sdl_fail("SDL_CreateGPUShader shader_code_quad_vert");
@@ -226,7 +217,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (!fs)
         return sdl_fail("SDL_CreateGPUShader shader_code_quad_frag");
 
-    auto color_target_desc = (SDL_GPUColorTargetDescription){
+    SDL_GPUColorTargetDescription color_target_desc = {
         .format = SDL_GetGPUSwapchainTextureFormat(g_app.gpu, g_app.window),
         .blend_state = (SDL_GPUColorTargetBlendState){
             .enable_blend = true,
@@ -288,19 +279,41 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     uint64_t current_ticks = SDL_GetPerformanceCounter();
     uint64_t elapsed_ticks = current_ticks - g_app.last_frame_ticks;
     g_app.last_frame_ticks = current_ticks;
+    float dt = (float)elapsed_ticks / (float)g_app.ticks_freq;
 
-    SDL_GPUColorTargetInfo color_target_info = {
-        .texture = swap_tex,
-        .clear_color = (SDL_FColor){0x26 / 255.0f, 0xA6 / 255.0f, 0x9A / 255.0f, 1.0f},
-        .load_op = SDL_GPU_LOADOP_CLEAR,
-        .store_op = SDL_GPU_STOREOP_STORE,
+    static float t = 0;
+    float s = sinf(t);
+    float c = cosf(t);
+    float scale = 0.5f;
+    float xform1[8] = {
+        c*scale, s*scale, 0.0f, 0.0f,
+        -s*scale, c*scale, 0.0f, 0.0f,
     };
+    s = sinf(t * -1.5f);
+    c = cosf(t * -1.5f);
+    scale = 0.3f;
+    float xform2[8] = {
+        c*scale, s*scale, 0.0f, 0.0f,
+        -s*scale, c*scale, 0.0f, 0.0f,
+    };
+    t += dt;
+
     {
+        SDL_GPUColorTargetInfo color_target_info = {
+            .texture = swap_tex,
+            .clear_color = (SDL_FColor){0x26 / 255.0f, 0xA6 / 255.0f, 0x9A / 255.0f, 1.0f},
+            .load_op = SDL_GPU_LOADOP_CLEAR,
+            .store_op = SDL_GPU_STOREOP_STORE,
+        };
         SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmdbuf, &color_target_info, 1, nullptr);
 
         SDL_BindGPUGraphicsPipeline(pass, g_app.pipeline);
         SDL_BindGPUVertexBuffers(pass, 0, &(SDL_GPUBufferBinding){.buffer = g_app.vertex_buffer, .offset = 0}, 1);
         SDL_BindGPUFragmentSamplers(pass, 0, &(SDL_GPUTextureSamplerBinding){g_app.texture, g_app.sampler}, 1);
+        SDL_PushGPUVertexUniformData(cmdbuf, 0, xform1, sizeof(xform1));
+        SDL_DrawGPUPrimitives(pass, ARRAY_LENGTH(vertices), 1, 0, 0);
+        SDL_BindGPUFragmentSamplers(pass, 0, &(SDL_GPUTextureSamplerBinding){g_app.alien_tex, g_app.sampler}, 1);
+        SDL_PushGPUVertexUniformData(cmdbuf, 0, xform2, sizeof(xform2));
         SDL_DrawGPUPrimitives(pass, ARRAY_LENGTH(vertices), 1, 0, 0);
 
         SDL_EndGPURenderPass(pass);
@@ -313,7 +326,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     (void)appstate;
 
-    if (event->type == SDL_EVENT_QUIT) {
+    if (event->type == SDL_EVENT_QUIT || (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_ESCAPE)) {
         g_app.quit = SDL_APP_SUCCESS;
     }
 

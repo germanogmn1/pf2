@@ -7,7 +7,6 @@ layout(set = 2, binding = 0) uniform sampler2D image;
 
 layout(location = 0) out vec4 color;
 
-
 void main() {
     vec4 texel = texture(image, f_tex);
     texel.rgb *= f_color.rgb;

@@ -22,6 +22,10 @@ for SRC in $SHADER_SOURCES; do
 done
 
 mkdir -p build
+if [[ ! -h build/assets ]]; then
+	ln -s ../assets build/assets
+fi
+
 SDL_OUT="$(pwd)/vendor/SDL/build"
 
 clang src/main.c \

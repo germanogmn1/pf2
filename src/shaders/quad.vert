@@ -7,8 +7,12 @@ layout(location = 2) in vec4 v_color;
 layout(location = 0) out vec2 f_tex;
 layout(location = 1) out vec4 f_color;
 
+layout (set = 1, binding = 0) uniform UBO {
+    mat2 transform;
+};
+
 void main() {
     f_tex = v_tex;
     f_color = v_color;
-    gl_Position = vec4(v_position, 1, 1);
+    gl_Position = vec4(transform * v_position, 1, 1);
 }
